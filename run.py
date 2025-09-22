@@ -12,6 +12,8 @@ import urllib3
 # Configuration from environment variables with defaults
 VPN_GW = os.getenv('VPN_GATEWAY', '10.2.0.1')
 QB_URL = os.getenv('QB_URL', 'http://127.0.0.1:9080')
+QB_USER = os.getenv('QB_USER', '')
+QB_PASS = os.getenv('QB_PASS', '')
 
 #########################################################################################################
 # Logging
@@ -21,6 +23,10 @@ logger = logging.getLogger(__name__)
 # Log configuration
 logger.info(f"Using VPN Gateway: {VPN_GW}")
 logger.info(f"Using qBittorrent URL: {QB_URL}")
+if QB_USER and QB_PASS:
+    logger.info(f"Using qBittorrent User: {QB_USER} (authentication enabled)")
+else:
+    logger.info("qBittorrent authentication disabled (no credentials provided)")
 
 #########################################################################################################
 # NAT-PMP
@@ -221,19 +227,80 @@ class NatPmpClient(object):
 ###############################################################################
 # qBittorrent
 _http = urllib3.PoolManager()
+
+def qb_login():
+    """Login to qBittorrent and return session cookie"""
+    login_url = f"{QB_URL}/api/v2/auth/login"
+    login_data = urlencode({
+        'username': QB_USER,
+        'password': QB_PASS
+    })
+    
+    logger.debug(f"Attempting to login to qBittorrent at {login_url}")
+    
+    response = _http.request(
+        'POST',
+        login_url,
+        body=login_data,
+        headers={
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': QB_URL
+        }
+    )
+    
+    if response.status != 200:
+        logger.error(f"Login failed with status {response.status}: {response.data.decode('utf-8', errors='ignore')}")
+        raise Exception(f"Failed to login to qBittorrent: {response.status}")
+    
+    # Check response body for "Ok." or "Fails."
+    response_text = response.data.decode('utf-8', errors='ignore').strip()
+    if response_text == "Fails.":
+        logger.error("Login failed: Invalid credentials")
+        raise Exception("Invalid qBittorrent credentials")
+    elif response_text != "Ok.":
+        logger.warning(f"Unexpected login response: {response_text}")
+    
+    # Extract SID cookie from response
+    cookies = response.headers.get('Set-Cookie', '')
+    for cookie in cookies.split(';'):
+        if 'SID=' in cookie:
+            sid = cookie.split('SID=')[1].split(';')[0]
+            logger.debug("Successfully authenticated with qBittorrent")
+            return sid
+    
+    logger.error("No SID cookie received from qBittorrent")
+    raise Exception("No SID cookie received from qBittorrent login")
+
 def update_qbittorrent(**kwargs):
     url = f"{QB_URL}/api/v2/app/setPreferences"
     data_encoded = urlencode({"json": json.dumps(kwargs)})
 
+    logger.debug(f"Updating qBittorrent preferences: {kwargs}")
+    
+    # Prepare headers
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+    
+    # Add authentication if credentials are provided
+    if QB_USER and QB_PASS:
+        # Login to get session cookie
+        sid = qb_login()
+        headers['Cookie'] = f'SID={sid}'
+        logger.debug("Using authenticated request")
+    else:
+        logger.debug("Using unauthenticated request")
+    
     response = _http.request(
         'POST',
         url,
         body=data_encoded,
-        headers={'Content-Type': 'application/x-www-form-urlencoded'}
+        headers=headers
     )
 
     if response.status != 200:
-        raise Exception(f"Failed to update qBittorrent : {response.status}")
+        logger.error(f"Failed to update qBittorrent preferences: {response.status} - {response.data.decode('utf-8', errors='ignore')}")
+        raise Exception(f"Failed to update qBittorrent: {response.status}")
+    
+    logger.info("Successfully updated qBittorrent preferences")
 
 ###############################################################################
 def refresh_qb_port():
