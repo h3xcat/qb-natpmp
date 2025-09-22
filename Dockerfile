@@ -21,7 +21,7 @@ RUN pip3 install --upgrade pip && pip3 install --no-cache-dir wheel && pip3 inst
 ##############################################################################################
 FROM python:3-slim-trixie AS runtime
 
-RUN apt-get update && apt-get upgrade -y && apt-get install -y gosu libnatpmp-dev
+RUN apt-get update && apt-get upgrade -y && apt-get install -y gosu && apt-get clean
 
 COPY --from=builder /opt/app /opt/app
 

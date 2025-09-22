@@ -3,17 +3,15 @@ import json
 import os
 from urllib.parse import urlencode
 import logging
-import ipaddress
-import select
-from socket import ntohl, htonl
-import ctypes
+import socket
+import struct
 import urllib3
 
 # Configuration from environment variables with defaults
 VPN_GW = os.getenv('VPN_GATEWAY', '10.2.0.1')
 QB_URL = os.getenv('QB_URL', 'http://127.0.0.1:9080')
-QB_USER = os.getenv('QB_USER', '')
-QB_PASS = os.getenv('QB_PASS', '')
+QB_USER = os.getenv('QB_USER', 'admin')
+QB_PASS = os.getenv('QB_PASS', 'admin')
 
 #########################################################################################################
 # Logging
@@ -23,272 +21,162 @@ logger = logging.getLogger(__name__)
 # Log configuration
 logger.info(f"Using VPN Gateway: {VPN_GW}")
 logger.info(f"Using qBittorrent URL: {QB_URL}")
-if QB_USER and QB_PASS:
-    logger.info(f"Using qBittorrent User: {QB_USER} (authentication enabled)")
-else:
-    logger.info("qBittorrent authentication disabled (no credentials provided)")
+logger.info(f"Using qBittorrent User: {QB_USER}")
 
 #########################################################################################################
-# NAT-PMP
-NATPMP_TRYAGAIN = -100
-NATPMP_RESPTYPE_PUBLICADDRESS = 0
-NATPMP_RESPTYPE_UDPPORTMAPPING = 1
-NATPMP_RESPTYPE_TCPPORTMAPPING = 2
-NATPMP_PROTOCOL_UDP = 1
-NATPMP_PROTOCOL_TCP = 2
-
-if ctypes.sizeof(ctypes.c_void_p) == ctypes.sizeof(ctypes.c_int64):
-    _time_t = ctypes.c_int64
-    _suseconds_t = ctypes.c_int64
-else:
-    _time_t = ctypes.c_int32
-    _suseconds_t = ctypes.c_int32
-
-class _timeval(ctypes.Structure):
-    _fields_ = [
-        ('tv_sec', _time_t),
-        ('tv_usec', _suseconds_t)
-    ]
-
-class _natpmp_t(ctypes.Structure):
-    _fields_ = [
-        ('s', ctypes.c_int),
-        ('gateway', ctypes.c_uint32),
-        ('has_pending_request', ctypes.c_int),
-        ('pending_request', ctypes.c_char * 12),
-        ('pending_request_len', ctypes.c_int),
-        ('try_number', ctypes.c_int),
-        ('retry_time', _timeval) # Assuming struct timeval is two ints
-    ]
-
-class _newportmapping_t(ctypes.Structure):
-    _fields_ = [
-        ('privateport', ctypes.c_uint16),
-        ('mappedpublicport', ctypes.c_uint16),
-        ('lifetime', ctypes.c_uint32)
-    ]
-
-class _publicaddress_t(ctypes.Structure):
-    _fields_ = [("addr", ctypes.c_uint32)] # You can also use socket.in_addr
-
-class _newportmapping_t(ctypes.Structure):
-    _fields_ = [("privateport", ctypes.c_uint16),
-                ("mappedpublicport", ctypes.c_uint16),
-                ("lifetime", ctypes.c_uint32)]
-
-class _pnu_t(ctypes.Union):
-    _fields_ = [("publicaddress", _publicaddress_t),
-                ("newportmapping", _newportmapping_t)]
-
-class natpmpresp_t(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_uint16),
-                ("resultcode", ctypes.c_uint16),
-                ("epoch", ctypes.c_uint32),
-                ("pnu", _pnu_t)]
-
-_libnatpmp = ctypes.CDLL('libnatpmp.so')
-_libnatpmp.strnatpmperr.argtypes = [ctypes.c_int]
-_libnatpmp.strnatpmperr.restype = ctypes.c_char_p
-_libnatpmp.initnatpmp.argtypes = [ctypes.POINTER(_natpmp_t), ctypes.c_int, ctypes.c_uint32]
-_libnatpmp.initnatpmp.restype = ctypes.c_int
-_libnatpmp.closenatpmp.argtypes = [ctypes.POINTER(_natpmp_t)]
-_libnatpmp.closenatpmp.restype = ctypes.c_int
-_libnatpmp.sendpublicaddressrequest.argtypes = [ctypes.POINTER(_natpmp_t)]
-_libnatpmp.sendpublicaddressrequest.restype = ctypes.c_int
-_libnatpmp.sendnewportmappingrequest.argtypes = [ctypes.POINTER(_natpmp_t), ctypes.c_int, ctypes.c_uint16, ctypes.c_uint16, ctypes.c_uint32]
-_libnatpmp.sendnewportmappingrequest.restype = ctypes.c_int
-
-
-_reserved_addresses = [
-    ipaddress.ip_network('0.0.0.0/8'),        # RFC1122: "This host on this network"
-    ipaddress.ip_network('10.0.0.0/8'),       # RFC1918: Private-Use
-    ipaddress.ip_network('100.64.0.0/10'),    # RFC6598: Shared Address Space
-    ipaddress.ip_network('127.0.0.0/8'),      # RFC1122: Loopback
-    ipaddress.ip_network('169.254.0.0/16'),   # RFC3927: Link-Local
-    ipaddress.ip_network('172.16.0.0/12'),    # RFC1918: Private-Use
-    ipaddress.ip_network('192.0.0.0/24'),     # RFC6890: IETF Protocol Assignments
-    ipaddress.ip_network('192.0.2.0/24'),     # RFC5737: Documentation (TEST-NET-1)
-    ipaddress.ip_network('192.31.196.0/24'),  # RFC7535: AS112-v4
-    ipaddress.ip_network('192.52.193.0/24'),  # RFC7450: AMT
-    ipaddress.ip_network('192.88.99.0/24'),   # RFC7526: 6to4 Relay Anycast
-    ipaddress.ip_network('192.168.0.0/16'),   # RFC1918: Private-Use
-    ipaddress.ip_network('192.175.48.0/24'),  # RFC7534: Direct Delegation AS112 Service
-    ipaddress.ip_network('198.18.0.0/15'),    # RFC2544: Benchmarking
-    ipaddress.ip_network('198.51.100.0/24'),  # RFC5737: Documentation (TEST-NET-2)
-    ipaddress.ip_network('203.0.113.0/24'),   # RFC5737: Documentation (TEST-NET-3)
-    ipaddress.ip_network('224.0.0.0/4'),      # RFC1112: Multicast
-    ipaddress.ip_network('240.0.0.0/4'),      # RFC1112: Reserved for Future Use + RFC919 Limited Broadcast
-]
-
-def _addr_is_reserved(ip_address):
-    for network in _reserved_addresses:
-        if ip_address in network:
-            return True
-    return False
-
+# NAT-PMP Implementation
 class NatPmpError(Exception):
     def __init__(self, message, error_code=None):
         super().__init__(message)
         self.error_code = error_code
 
 class NatPmpClient(object):
-    def __init__(self, gateway : ipaddress.IPv4Address = None):
-        self.gateway = ipaddress.IPv4Address(gateway)
-        self._natpmp = _natpmp_t()
-        self._timeout = _timeval()
-        self._response = natpmpresp_t()
+    def __init__(self, gateway: str, timeout: float = 5.0):
+        self.gateway = gateway
+        self.timeout = timeout
+        self.sock = None
 
-        if not self._init_natpmp():
-            raise NatPmpError("Failed to initialize NATPMP")
+    def _send_request(self, request_data: bytes) -> bytes:
+        """Send NAT-PMP request and return response"""
+        if self.sock is None:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.settimeout(self.timeout)
+        
+        try:
+            self.sock.sendto(request_data, (self.gateway, 5351))
+            response, addr = self.sock.recvfrom(16)  # NAT-PMP responses are max 16 bytes
+            return response
+        except socket.timeout:
+            raise NatPmpError("NAT-PMP request timed out")
+        except Exception as e:
+            raise NatPmpError(f"NAT-PMP communication failed: {e}")
 
-    def _init_natpmp(self):
-        if self.gateway is not None:
-            r = _libnatpmp.initnatpmp(ctypes.byref(self._natpmp), 1, htonl(int(self.gateway)))
-        else:
-            r = _libnatpmp.initnatpmp(ctypes.byref(self._natpmp), 0, 0)
+    def get_public_address(self) -> str:
+        """Get public IP address via NAT-PMP"""
+        # NAT-PMP public address request: version(0) + opcode(0)
+        request = struct.pack('!BB', 0, 0)
+        
+        response = self._send_request(request)
+        
+        if len(response) < 12:
+            raise NatPmpError(f"Invalid response length: {len(response)}")
+        
+        # Parse response: version, opcode, result, epoch, public_ip
+        version, opcode, result, epoch, public_ip = struct.unpack('!BBHIL', response)
+        
+        if version != 0:
+            raise NatPmpError(f"Invalid NAT-PMP version: {version}")
+        
+        if opcode != 0x80:  # Public address response
+            raise NatPmpError(f"Unexpected response opcode: {opcode:#x}")
+        
+        if result != 0:
+            raise NatPmpError(f"NAT-PMP error result: {result}")
+        
+        # Convert IP to string
+        public_ip_str = socket.inet_ntoa(struct.pack('!I', public_ip))
+        logger.info(f"Got public IP: {public_ip_str}")
+        
+        return public_ip_str
 
-        if(r < 0):
-            raise NatPmpError(f"initnatpmp() failed with error code {r}", r)
-
-        if self.gateway is None:
-            logger.info(f"using gateway : {ipaddress.ip_address(ntohl(self._natpmp.gateway))}")
-        return True
-
-    def get_publicaddress(self):
-        r = _libnatpmp.sendpublicaddressrequest(ctypes.byref(self._natpmp))
-        if r < 0:
-            raise NatPmpError(f"sendpublicaddressrequest() failed with error code {r}", r)
-
-        # logger.info(f"sendpublicaddressrequest() returned {r} ({'SUCCESS' if r==2 else 'FAILED'})")
-        self._get_response(NATPMP_RESPTYPE_PUBLICADDRESS)
-
-        public_address = ipaddress.ip_address(ntohl(self._response.pnu.publicaddress.addr))
-
-        if _addr_is_reserved(public_address):
-            raise NatPmpError(f"Invalid Public IP address {public_address}")
-
-        return public_address
-
-    def portmap(self, protocol : int, private_port : int = 0, public_port : int = 0, lifetime : int = 3600):
-        if protocol not in [NATPMP_PROTOCOL_UDP, NATPMP_PROTOCOL_TCP]:
-            raise ValueError("Invalid protocol")
-
-        r = _libnatpmp.sendnewportmappingrequest(ctypes.byref(self._natpmp), protocol, 0, 0, 3600)
-        if r != 12:
-            raise NatPmpError(f"sendnewportmappingrequest() failed with error code {r}", r)
-
-        # logger.info(f"sendnewportmappingrequest returned {r} ({'SUCCESS' if r==12 else 'FAILED'})")
-        self._get_response(NATPMP_RESPTYPE_UDPPORTMAPPING if protocol==NATPMP_PROTOCOL_UDP else NATPMP_RESPTYPE_TCPPORTMAPPING)
-
-        return {
-            'public_port': self._response.pnu.newportmapping.mappedpublicport,
-            'private_port': self._response.pnu.newportmapping.privateport,
-            'epoch': self._response.epoch,
-            'lifetime': self._response.pnu.newportmapping.lifetime
+    def create_port_mapping(self, protocol: str, internal_port: int = 0, external_port: int = 0, lifetime: int = 3600) -> dict:
+        """Create port mapping via NAT-PMP"""
+        if protocol.upper() not in ['TCP', 'UDP']:
+            raise ValueError("Protocol must be 'TCP' or 'UDP'")
+        
+        # NAT-PMP port mapping request
+        # version(0) + opcode(1=UDP, 2=TCP) + reserved(0) + internal_port + external_port + lifetime
+        opcode = 1 if protocol.upper() == 'UDP' else 2
+        request = struct.pack('!BBHHHL', 0, opcode, 0, internal_port, external_port, lifetime)
+        
+        response = self._send_request(request)
+        
+        if len(response) < 16:
+            raise NatPmpError(f"Invalid port mapping response length: {len(response)}")
+        
+        # Parse response: version, opcode, result, epoch, internal_port, external_port, lifetime
+        version, resp_opcode, result, epoch, resp_internal, resp_external, resp_lifetime = struct.unpack('!BBHIHHL', response)
+        
+        if version != 0:
+            raise NatPmpError(f"Invalid NAT-PMP version: {version}")
+        
+        expected_opcode = 0x81 if protocol.upper() == 'UDP' else 0x82
+        if resp_opcode != expected_opcode:
+            raise NatPmpError(f"Unexpected response opcode: {resp_opcode:#x}, expected: {expected_opcode:#x}")
+        
+        if result != 0:
+            raise NatPmpError(f"Port mapping failed with result: {result}")
+        
+        mapping_info = {
+            'protocol': protocol.upper(),
+            'internal_port': resp_internal,
+            'external_port': resp_external,
+            'lifetime': resp_lifetime,
+            'epoch': epoch
         }
-
-    def _get_response(self, response_type : int):
-        while True:
-            _libnatpmp.getnatpmprequesttimeout(ctypes.byref(self._natpmp), ctypes.byref(self._timeout))
-
-            # Convert the timeval to a floating-point number of seconds
-            timeout_seconds = self._timeout.tv_sec + self._timeout.tv_usec / 1e6
-
-            select.select([self._natpmp.s], [], [], timeout_seconds)
-
-            r = _libnatpmp.readnatpmpresponseorretry(ctypes.byref(self._natpmp), ctypes.byref(self._response));
-
-            # logger.info(f"readnatpmpresponseorretry returned {r} ({'OK' if r==0 else ('TRY AGAIN' if r==NATPMP_TRYAGAIN else 'FAILED')})")
-            if r<0 and r!=NATPMP_TRYAGAIN:
-                logging.error(f"readnatpmpresponseorretry() failed : '{_libnatpmp.strnatpmperr(r).decode('utf-8')}'")
-
-            if (r >= 0 and self._response.type != response_type):
-                retry = self._natpmp.try_number <= 9
-                logger.info(f"readnatpmpresponseorretry received unexpected reply type {self._response.type} (expected {response_type}), {'retrying' if retry == 1 else 'no more retry'}...")
-
-                if retry:
-                    r = NATPMP_TRYAGAIN
-                    self._natpmp.has_pending_request = 1
-
-            if(r != NATPMP_TRYAGAIN): break
-
-        if r<0: raise NatPmpError(f"Failed to read response : {_libnatpmp.strnatpmperr(r).decode('utf-8')}", error_code=r)
+        
+        logger.info(f"{protocol.upper()} port mapping: {resp_external} -> {resp_internal} (lifetime: {resp_lifetime}s)")
+        
+        return mapping_info
 
     def close(self):
-        r = _libnatpmp.closenatpmp(ctypes.byref(self._natpmp))
-        if(r<0): raise NatPmpError(f"Failed to close NATPMP : {_libnatpmp.strnatpmperr(r).decode('utf-8')}", error_code=r)
+        """Close the socket"""
+        if self.sock:
+            self.sock.close()
+            self.sock = None
 
     def __del__(self):
-        try:
-            self.close()
-        except NatPmpError as e:
-            pass
+        self.close()
 
 ###############################################################################
-# qBittorrent
+# qBittorrent API
 _http = urllib3.PoolManager()
+_session_cookie = None
 
-def qb_login():
-    """Login to qBittorrent and return session cookie"""
-    login_url = f"{QB_URL}/api/v2/auth/login"
-    login_data = urlencode({
-        'username': QB_USER,
-        'password': QB_PASS
-    })
+def _login_qbittorrent():
+    """Login to qBittorrent and get session cookie"""
+    global _session_cookie
     
-    logger.debug(f"Attempting to login to qBittorrent at {login_url}")
-    
+    login_data = f"username={QB_USER}&password={QB_PASS}"
     response = _http.request(
         'POST',
-        login_url,
+        f"{QB_URL}/api/v2/auth/login",
         body=login_data,
-        headers={
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Referer': QB_URL
-        }
+        headers={'Content-Type': 'application/x-www-form-urlencoded'}
     )
     
     if response.status != 200:
-        logger.error(f"Login failed with status {response.status}: {response.data.decode('utf-8', errors='ignore')}")
-        raise Exception(f"Failed to login to qBittorrent: {response.status}")
+        raise Exception(f"qBittorrent login failed: HTTP {response.status}")
     
-    # Check response body for "Ok." or "Fails."
-    response_text = response.data.decode('utf-8', errors='ignore').strip()
-    if response_text == "Fails.":
-        logger.error("Login failed: Invalid credentials")
-        raise Exception("Invalid qBittorrent credentials")
-    elif response_text != "Ok.":
-        logger.warning(f"Unexpected login response: {response_text}")
+    if response.data.decode().strip() != "Ok.":
+        raise Exception("qBittorrent login failed: Invalid credentials")
     
-    # Extract SID cookie from response
-    cookies = response.headers.get('Set-Cookie', '')
-    for cookie in cookies.split(';'):
-        if 'SID=' in cookie:
-            sid = cookie.split('SID=')[1].split(';')[0]
-            logger.debug("Successfully authenticated with qBittorrent")
-            return sid
+    # Get session cookie
+    for header_name, header_value in response.headers.items():
+        if header_name.lower() == 'set-cookie':
+            _session_cookie = header_value
+            logger.info("Successfully logged into qBittorrent")
+            return
     
-    logger.error("No SID cookie received from qBittorrent")
-    raise Exception("No SID cookie received from qBittorrent login")
+    # Some qBittorrent versions don't use cookies, login success is enough
+    _session_cookie = "logged_in"
+    logger.info("qBittorrent login successful (no cookie)")
 
 def update_qbittorrent(**kwargs):
+    """Update qBittorrent preferences"""
+    global _session_cookie
+    
+    # Login if we haven't already
+    if _session_cookie is None:
+        _login_qbittorrent()
+    
     url = f"{QB_URL}/api/v2/app/setPreferences"
     data_encoded = urlencode({"json": json.dumps(kwargs)})
-
-    logger.debug(f"Updating qBittorrent preferences: {kwargs}")
     
-    # Prepare headers
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    
-    # Add authentication if credentials are provided
-    if QB_USER and QB_PASS:
-        # Login to get session cookie
-        sid = qb_login()
-        headers['Cookie'] = f'SID={sid}'
-        logger.debug("Using authenticated request")
-    else:
-        logger.debug("Using unauthenticated request")
-    
+    if _session_cookie and _session_cookie != "logged_in":
+        headers['Cookie'] = _session_cookie
+
     response = _http.request(
         'POST',
         url,
@@ -296,41 +184,80 @@ def update_qbittorrent(**kwargs):
         headers=headers
     )
 
+    if response.status == 403:
+        # Try to login again
+        logger.info("Got 403, attempting to re-login...")
+        _session_cookie = None
+        _login_qbittorrent()
+        
+        # Retry the request
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        if _session_cookie and _session_cookie != "logged_in":
+            headers['Cookie'] = _session_cookie
+            
+        response = _http.request(
+            'POST',
+            url,
+            body=data_encoded,
+            headers=headers
+        )
+
     if response.status != 200:
-        logger.error(f"Failed to update qBittorrent preferences: {response.status} - {response.data.decode('utf-8', errors='ignore')}")
-        raise Exception(f"Failed to update qBittorrent: {response.status}")
-    
-    logger.info("Successfully updated qBittorrent preferences")
+        raise Exception(f"Failed to update qBittorrent: HTTP {response.status}")
+
+    logger.info(f"Updated qBittorrent settings: {kwargs}")
 
 ###############################################################################
 def refresh_qb_port():
+    """Main function to refresh qBittorrent port mapping"""
     npc = NatPmpClient(VPN_GW)
-    public_ip = npc.get_publicaddress()
-    tcp_portmap = npc.portmap(NATPMP_PROTOCOL_TCP)
-    udp_portmap = npc.portmap(NATPMP_PROTOCOL_UDP, private_port=tcp_portmap['private_port'], public_port=tcp_portmap['public_port'])
+    
+    try:
+        # Get public IP
+        public_ip = npc.get_public_address()
+        
+        # Create TCP port mapping (qBittorrent needs TCP)
+        tcp_mapping = npc.create_port_mapping('TCP', internal_port=0, external_port=0, lifetime=3600)
+        
+        # Create UDP port mapping for the same ports (for DHT)
+        udp_mapping = npc.create_port_mapping('UDP', 
+                                            internal_port=tcp_mapping['internal_port'], 
+                                            external_port=tcp_mapping['external_port'], 
+                                            lifetime=3600)
+        
+        # Update qBittorrent configuration
+        update_qbittorrent(
+            listen_port=tcp_mapping['internal_port'],
+            random_port=False,
+            upnp=False,
+            natpmp=False  # Disable built-in NAT-PMP since we're handling it
+        )
+        
+        result = {
+            'public_ip': public_ip,
+            'tcp_mapping': tcp_mapping,
+            'udp_mapping': udp_mapping
+        }
+        
+        logger.info(f"Port forwarding successful: {public_ip}:{tcp_mapping['external_port']} -> local:{tcp_mapping['internal_port']}")
+        
+        return result
+        
+    finally:
+        npc.close()
 
-    logger.info(f"TCP port mapping : {public_ip}:{tcp_portmap['public_port']} -> local:{tcp_portmap['private_port']}")
-    logger.info(f"UDP port mapping : {public_ip}:{udp_portmap['public_port']} -> local:{udp_portmap['private_port']}")
-
-    update_qbittorrent(listen_port=tcp_portmap['private_port'], random_port=False, upnp=False)
-    npc.close()
-    return {
-        'tcp_portmap': tcp_portmap,
-        'udp_portmap': udp_portmap,
-        'public_ip': public_ip
-    }
-
-# Main
+# Main loop
 if __name__ == "__main__":
-    next_refresh = time.time()
-    sleep_time = 10
     while True:
-        logger.info("Refreshing qBittorrent port...")
+        logger.info("Refreshing qBittorrent port mapping...")
         try:
             result = refresh_qb_port()
-            sleep_time = max(result['tcp_portmap']['lifetime'], 30)
+            # Sleep for 90% of the lifetime, minimum 30 seconds
+            sleep_time = max(int(result['tcp_mapping']['lifetime'] * 0.9), 30)
+            logger.info(f"Next refresh in {sleep_time} seconds")
+            
         except Exception as e:
-            logging.error(e)
-
-        next_refresh = time.time() + sleep_time - 5
-        time.sleep(next_refresh - time.time())
+            logger.error(f"Port mapping failed: {e}")
+            sleep_time = 60  # Retry in 1 minute on error
+            
+        time.sleep(sleep_time)
