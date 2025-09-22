@@ -1,5 +1,5 @@
 # temp stage
-FROM python:3-slim-bullseye as builder
+FROM python:3-slim-trixie AS builder
 
 # avoid stuck build due to user prompt
 ARG DEBIAN_FRONTEND=noninteractive
@@ -19,7 +19,7 @@ RUN pip3 install --upgrade pip && pip3 install --no-cache-dir wheel && pip3 inst
 
 
 ##############################################################################################
-FROM python:3-slim-bullseye as runtime
+FROM python:3-slim-trixie AS runtime
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y gosu libnatpmp-dev
 
@@ -28,11 +28,11 @@ COPY --from=builder /opt/app /opt/app
 # make sure all messages always reach console
 
 ENV PATH="/opt/app/.venv/bin:$PATH"
-ENV LANG C.UTF-8
-ENV LC_ALL C.UTF-8
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONFAULTHANDLER 1
-ENV PYTHONUNBUFFERED 1
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONFAULTHANDLER=1
+ENV PYTHONUNBUFFERED=1
 
 
 # activate virtual environment
