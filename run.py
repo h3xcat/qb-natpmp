@@ -1,5 +1,6 @@
 import time
 import json
+import os
 from urllib.parse import urlencode
 import logging
 import ipaddress
@@ -8,12 +9,18 @@ from socket import ntohl, htonl
 import ctypes
 import urllib3
 
-VPN_GW = '10.2.0.1'
+# Configuration from environment variables with defaults
+VPN_GW = os.getenv('VPN_GATEWAY', '10.2.0.1')
+QB_URL = os.getenv('QB_URL', 'http://127.0.0.1:9080')
 
 #########################################################################################################
 # Logging
 logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', datefmt='%Y-%m-%d %H:%M:%S', level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Log configuration
+logger.info(f"Using VPN Gateway: {VPN_GW}")
+logger.info(f"Using qBittorrent URL: {QB_URL}")
 
 #########################################################################################################
 # NAT-PMP
@@ -215,7 +222,7 @@ class NatPmpClient(object):
 # qBittorrent
 _http = urllib3.PoolManager()
 def update_qbittorrent(**kwargs):
-    url = "http://127.0.0.1:9080/api/v2/app/setPreferences"
+    url = f"{QB_URL}/api/v2/app/setPreferences"
     data_encoded = urlencode({"json": json.dumps(kwargs)})
 
     response = _http.request(
