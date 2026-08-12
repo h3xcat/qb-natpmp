@@ -127,9 +127,34 @@ class NatPmpClient(object):
 
     def __del__(self):
         self.close()
+    
+    def __enter__(self):
+        return self
 
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 ###############################################################################
 # qBittorrent API
+import requests
+
+class QbittorrentClient:
+    def __init__(self, base_url, username, password):
+        self.base_url = base_url
+        self.session = requests.Session()
+        self.session.post(
+            f"{self.base_url}/api/v2/auth/login",
+            data={'username': username, 'password': password}
+        ).raise_for_status()
+        logger.info("Successfully logged into qBittorrent")
+
+    def update_preferences(self, **kwargs):
+        url = f"{self.base_url}/api/v2/app/setPreferences"
+        # The requests library handles cookie persistence automatically
+        self.session.post(url, data={'json': json.dumps(kwargs)}).raise_for_status()
+        logger.info(f"Updated qBittorrent settings: {kwargs}")
+
+
+
 _http = urllib3.PoolManager()
 _session_cookie = None
 
