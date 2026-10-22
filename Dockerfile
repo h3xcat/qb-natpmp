@@ -39,10 +39,12 @@ ENV PYTHONUNBUFFERED=1
 ENV VIRTUAL_ENV="/opt/app/.venv"
 
 WORKDIR /opt/app
-COPY run.py run.py
+COPY run.py natpmp.py qbittorrent.py health.py ./
 
 COPY ./entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT [ "/entrypoint.sh" ]
 CMD [ "python3", "run.py" ]
+HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=2 \
+    CMD [ "python3", "/opt/app/health.py" ]
 # VOLUME [ "/reports" ]
