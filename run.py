@@ -135,26 +135,6 @@ class NatPmpClient(object):
         self.close()
 ###############################################################################
 # qBittorrent API
-import requests
-
-class QbittorrentClient:
-    def __init__(self, base_url, username, password):
-        self.base_url = base_url
-        self.session = requests.Session()
-        self.session.post(
-            f"{self.base_url}/api/v2/auth/login",
-            data={'username': username, 'password': password}
-        ).raise_for_status()
-        logger.info("Successfully logged into qBittorrent")
-
-    def update_preferences(self, **kwargs):
-        url = f"{self.base_url}/api/v2/app/setPreferences"
-        # The requests library handles cookie persistence automatically
-        self.session.post(url, data={'json': json.dumps(kwargs)}).raise_for_status()
-        logger.info(f"Updated qBittorrent settings: {kwargs}")
-
-
-
 _http = urllib3.PoolManager()
 _session_cookie = None
 
@@ -162,7 +142,7 @@ def _login_qbittorrent():
     """Login to qBittorrent and get session cookie"""
     global _session_cookie
     
-    login_data = f"username={QB_USER}&password={QB_PASS}"
+    login_data = urlencode({'username': QB_USER, 'password': QB_PASS})
     response = _http.request(
         'POST',
         f"{QB_URL}/api/v2/auth/login",
@@ -170,10 +150,12 @@ def _login_qbittorrent():
         headers={'Content-Type': 'application/x-www-form-urlencoded'}
     )
     
-    if response.status != 200:
+    if response.status not in (200, 204):
         raise Exception(f"qBittorrent login failed: HTTP {response.status}")
     
-    if response.data.decode().strip() != "Ok.":
+    # Newer versions return 204 with no body; older versions return 200/Ok.
+    # A 200/Fails. response must still be rejected as invalid credentials.
+    if response.status == 200 and (response.data or b"").decode().strip() != "Ok.":
         raise Exception("qBittorrent login failed: Invalid credentials")
     
     # Get session cookie
@@ -227,7 +209,7 @@ def update_qbittorrent(**kwargs):
             headers=headers
         )
 
-    if response.status != 200:
+    if response.status not in (200, 204):
         raise Exception(f"Failed to update qBittorrent: HTTP {response.status}")
 
     logger.info(f"Updated qBittorrent settings: {kwargs}")
