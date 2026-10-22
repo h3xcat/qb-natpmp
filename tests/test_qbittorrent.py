@@ -23,12 +23,21 @@ class QbittorrentTests(unittest.TestCase):
         self.addCleanup(self.client.close)
 
     def test_legacy_and_no_content_logins_forward_session_cookie(self):
-        for status, body in ((200, b"Ok."), (204, b"")):
-            with self.subTest(status=status):
+        for status, body, cookie_name in (
+            (200, b"Ok.", "SID"),
+            (204, b"", "SID"),
+            (204, b"", "QBT_SID_8080"),
+            (200, b"Ok.", "custom-session"),
+        ):
+            with self.subTest(status=status, cookie_name=cookie_name):
                 self.client.session_cookie = None
                 self.http.reset_mock()
                 self.http.request.side_effect = [
-                    response(status, body, "SID=test-session; HttpOnly; path=/"),
+                    response(
+                        status, body,
+                        f"{cookie_name}=test-session; HttpOnly; SameSite=Strict; "
+                        "expires=Thu, 22 Oct 2026 06:00:00 GMT; path=/",
+                    ),
                     response(200),
                 ]
 
@@ -37,7 +46,9 @@ class QbittorrentTests(unittest.TestCase):
                 login, update = self.http.request.call_args_list
                 self.assertEqual(login.args, ("POST", f"{self.client.url}/api/v2/auth/login"))
                 self.assertEqual(update.args, ("POST", f"{self.client.url}/api/v2/app/setPreferences"))
-                self.assertEqual(update.kwargs["headers"]["Cookie"], "SID=test-session")
+                self.assertEqual(
+                    update.kwargs["headers"]["Cookie"], f"{cookie_name}=test-session"
+                )
                 for request in (login, update):
                     self.assertFalse(request.kwargs["retries"])
                     self.assertFalse(request.kwargs["redirect"])
@@ -93,14 +104,16 @@ class QbittorrentTests(unittest.TestCase):
         self.client.session_cookie = "SID=expired"
         self.http.request.side_effect = [
             response(403),
-            response(204, cookie="SID=renewed"),
+            response(204, cookie="QBT_SID_8080=renewed; HttpOnly; path=/"),
             response(204),
         ]
 
         self.client.update_preferences(listen_port=32849)
 
         self.assertEqual(self.http.request.call_count, 3)
-        self.assertEqual(self.http.request.call_args.kwargs["headers"]["Cookie"], "SID=renewed")
+        self.assertEqual(
+            self.http.request.call_args.kwargs["headers"]["Cookie"], "QBT_SID_8080=renewed"
+        )
 
     def test_failed_preference_update_is_rejected(self):
         self.client.session_cookie = "SID=test-session"
@@ -109,17 +122,20 @@ class QbittorrentTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "Failed to update qBittorrent: HTTP 500"):
             self.client.update_preferences(listen_port=32849)
 
-    def test_only_sid_is_forwarded_from_multiple_cookies(self):
+    def test_cookie_pairs_are_forwarded_without_attributes(self):
         headers = urllib3.HTTPHeaderDict()
         headers.add("Set-Cookie", "theme=dark; path=/")
-        headers.add("Set-Cookie", "SID=test-session; HttpOnly; SameSite=Strict; path=/")
+        headers.add("Set-Cookie", "QBT_SID_8080=test-session; HttpOnly; SameSite=Strict; path=/")
         self.http.request.side_effect = [
             urllib3.HTTPResponse(status=204, headers=headers), response(204)
         ]
 
         self.client.update_preferences(listen_port=32849)
 
-        self.assertEqual(self.http.request.call_args.kwargs["headers"]["Cookie"], "SID=test-session")
+        self.assertEqual(
+            self.http.request.call_args.kwargs["headers"]["Cookie"],
+            "theme=dark; QBT_SID_8080=test-session",
+        )
 
     def test_reauthentication_is_attempted_only_once(self):
         self.client.session_cookie = "SID=expired"
